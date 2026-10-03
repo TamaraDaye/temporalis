@@ -2,6 +2,7 @@
 package controlplane
 
 import (
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/netip"
@@ -39,17 +40,17 @@ type ViewServer struct {
 	subscribers map[SubscriberID]*Subscriber
 }
 
+func (vs *ViewServer) regiseter(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+}
 
-func runRegistrationServer() {
+func (vs *ViewServer) heartbeat(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+}
+
+func runRegistrationServer(vs *ViewServer) {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/register", register)
-	mux.HandleFunc("/heartbeat", heartbeat)
-}
-
-func register (w http.ResponseWriter, r *http.Request){ 
-}
-
-
-func heartbeat (w http.ResponseWriter, r *http.Request){ 
+	mux.HandleFunc("/register", vs.regiseter)
+	mux.HandleFunc("/heartbeat", vs.regiseter)
 }
