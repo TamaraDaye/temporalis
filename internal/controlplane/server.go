@@ -1,4 +1,4 @@
-// Package controlplane
+// Pckage controlplane
 package controlplane
 
 import (
@@ -14,6 +14,39 @@ import (
 	"time"
 	"uuid"
 )
+
+type (
+	ServiceID    string
+	InstanceID   string
+	SubscriberID string
+	Instances    map[InstanceID]Instance
+)
+
+type Subscriber struct {
+	ID   SubscriberID
+	Conn net.Conn
+}
+
+
+type RegisterRequest struct {
+	Service ServiceID `json:"service"`
+	Port    int       `json:"port"`
+}
+
+type Instance struct {
+	ID       InstanceID `json:"id"`
+	Endpoint string     `json:"endpoint"`
+}
+
+type View struct {
+	Version  uint64                  `json:"version"`
+	Services map[ServiceID]Instances `json:"services"`
+}
+
+func (i Instances) Add(id InstanceID, instance Instance) {
+	i[id] = instance
+}
+
 
 type ViewServer struct {
 	Application string
@@ -34,7 +67,7 @@ func (vs *ViewServer) addSubscriber(subcriber *Subscriber) {
 func (vs *ViewServer) subscribe(conn net.Conn) {
 	gatewayID := uuid.New()
 
-	conn.Write(gatewayID[:])
+	writeMessage(conn, gatewayID[:])
 
 	subscriber := Subscriber{ID: SubscriberID(gatewayID.String()), Conn: conn}
 
@@ -50,14 +83,11 @@ func (vs *ViewServer) subscribe(conn net.Conn) {
 
 	vs.Mu.RUnlock()
 
-
 	err := writeMessage(conn, data)
-
 	if err != nil {
 		panic("well well well")
 	}
 }
-
 
 func writeMessage(conn net.Conn, data []byte) error {
 	length := uint32(len(data))
@@ -68,6 +98,15 @@ func writeMessage(conn net.Conn, data []byte) error {
 
 	_, err := conn.Write(data)
 	return err
+}
+
+
+func (vs *ViewServer) update (){
+}
+
+
+func(vs *ViewServer) gatewayHeartbeat() {
+
 }
 
 func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
