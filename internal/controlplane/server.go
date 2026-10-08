@@ -3,6 +3,7 @@ package controlplane
 
 import (
 	// "encoding/json/v2"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,11 +13,7 @@ import (
 	"sync"
 	"time"
 	"uuid"
-
 )
-
-
-
 
 type ViewServer struct {
 	Application string
@@ -34,19 +31,43 @@ func (vs *ViewServer) addSubscriber(subcriber *Subscriber) {
 	vs.Subscribers[subcriber.ID] = subcriber
 }
 
-func (vs *ViewServer) subscribe(conn net.Conn) Subscriber {
+func (vs *ViewServer) subscribe(conn net.Conn) {
 	gatewayID := uuid.New()
 
 	conn.Write(gatewayID[:])
 
-	subscriber := Subscriber{ID: SubscriberID(gatewayID.String()), Conn: conn }
+	subscriber := Subscriber{ID: SubscriberID(gatewayID.String()), Conn: conn}
 
 	vs.Mu.Lock()
-	defer vs.Mu.Unlock()
 
 	vs.addSubscriber(&subscriber)
 
-	return  subscriber
+	vs.Mu.Unlock()
+
+	vs.Mu.RLock()
+
+	data, _ := json.Marshal(vs.View)
+
+	vs.Mu.RUnlock()
+
+
+	err := writeMessage(conn, data)
+
+	if err != nil {
+		panic("well well well")
+	}
+}
+
+
+func writeMessage(conn net.Conn, data []byte) error {
+	length := uint32(len(data))
+
+	if err := binary.Write(conn, binary.BigEndian, length); err != nil {
+		return err
+	}
+
+	_, err := conn.Write(data)
+	return err
 }
 
 func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
@@ -72,10 +93,9 @@ func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
 	fmt.Println(req)
 	w.WriteHeader(http.StatusOK)
 	vs.PrintView()
-
 }
 
-func (vs *ViewServer) applyRegistration(address string, service ServiceID) Instance{
+func (vs *ViewServer) applyRegistration(address string, service ServiceID) Instance {
 	id := InstanceID(uuid.New().String())
 	instance := Instance{id, address}
 	vs.Mu.Lock()
@@ -128,16 +148,13 @@ func RunRegistrationServer(vs *ViewServer) *http.ServeMux {
 	return mux
 }
 
-
 func runSubscriptionServer(vs *ViewServer) {
 	listener, err := net.Listen("tcp", ":9000")
-
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	defer listener.Close()
-
 
 	for {
 		conn, err := listener.Accept()
