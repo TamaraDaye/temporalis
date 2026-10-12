@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -14,7 +15,6 @@ import (
 	"sync"
 	"time"
 	"uuid"
-	"io"
 )
 
 var (
@@ -32,23 +32,21 @@ type (
 )
 
 type Subscriber struct {
-    ID      SubscriberID
-    Conn    net.Conn
-    Updates chan []byte
-
+	ID      SubscriberID
+	Conn    net.Conn
+	Updates chan []byte
 }
 
 func (s *Subscriber) update() {
 }
-
 
 type RegisterRequest struct {
 	Service ServiceID `json:"service"`
 	Port    int       `json:"port"`
 }
 type Ack struct {
-	ID string  `json:"id"`
-    Version uint64 `json:"version"`
+	ID      string `json:"id"`
+	Version uint64 `json:"version"`
 }
 
 func validateRequest(req *RegisterRequest) error {
@@ -90,7 +88,7 @@ type ViewServer struct {
 }
 
 func newSubscriber(id SubscriberID, conn net.Conn) Subscriber {
-	return Subscriber{ID: id, Conn: conn}
+	return Subscriber{ID: id, Conn: conn, Updates: make(chan []byte, 1)}
 }
 
 func (vs *ViewServer) addSubscriber(subcriber *Subscriber) {
@@ -102,98 +100,98 @@ func (vs *ViewServer) addSubscriber(subcriber *Subscriber) {
 }
 
 func (vs *ViewServer) subscribe(conn net.Conn) error {
-    gatewayID := SubscriberID(uuid.New().String())
+	gatewayID := SubscriberID(uuid.New().String())
 
-    vs.Mu.RLock()
+	vs.Mu.RLock()
 
-    message := struct {
-        ID   SubscriberID `json:"id"`
-        View View         `json:"view"`
-    }{
-        ID:   gatewayID,
-        View: vs.View,
-    }
+	message := struct {
+		ID   SubscriberID `json:"id"`
+		View View         `json:"view"`
+	}{
+		ID:   gatewayID,
+		View: vs.View,
+	}
 
-    data, err := json.Marshal(message)
+	data, err := json.Marshal(message)
 
-    vs.Mu.RUnlock()
+	vs.Mu.RUnlock()
 
-    if err != nil {
-        return fmt.Errorf("marshal initial view: %w", err)
-    }
+	if err != nil {
+		return fmt.Errorf("marshal initial view: %w", err)
+	}
 
-    if err := writeMessage(conn, data); err != nil {
-        return fmt.Errorf("send initial view: %w", err)
-    }
+	if err := writeMessage(conn, data); err != nil {
+		return fmt.Errorf("send initial view: %w", err)
+	}
 
-    if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-        return fmt.Errorf("set ACK deadline: %w", err)
-    }
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return fmt.Errorf("set ACK deadline: %w", err)
+	}
 
-    defer conn.SetReadDeadline(time.Time{})
+	defer conn.SetReadDeadline(time.Time{})
 
-    // Read the ACK using the same length-prefixed framing.
-    ackData, err := readMessage(conn)
-    if err != nil {
-        return fmt.Errorf("read gateway ACK: %w", err)
-    }
+	// Read the ACK using the same length-prefixed framing.
+	ackData, err := readMessage(conn)
+	if err != nil {
+		return fmt.Errorf("read gateway ACK: %w", err)
+	}
 
-    var ack Ack
-    if err := json.Unmarshal(ackData, &ack); err != nil {
-        return fmt.Errorf("decode gateway ACK: %w", err)
-    }
+	var ack Ack
+	if err := json.Unmarshal(ackData, &ack); err != nil {
+		return fmt.Errorf("decode gateway ACK: %w", err)
+	}
 
-    initialVersion := message.View.Version
+	initialVersion := message.View.Version
 
-    if ack.Version != initialVersion {
-        return fmt.Errorf(
-            "unexpected ACK version: got %d, expected %d",
-            ack.Version, initialVersion,
-        )
-    }
+	if ack.Version != initialVersion {
+		return fmt.Errorf(
+			"unexpected ACK version: got %d, expected %d",
+			ack.Version, initialVersion,
+		)
+	}
 
-    subscriber := newSubscriber(gatewayID, conn)
+	subscriber := newSubscriber(gatewayID, conn)
 
-    vs.Mu.Lock()
+	vs.Mu.Lock()
 
-    vs.addSubscriber(&subscriber)
+	vs.addSubscriber(&subscriber)
 
-    if vs.View.Version > initialVersion {
-        latest, err := json.Marshal(vs.View)
-        if err != nil {
-            delete(vs.Subscribers, gatewayID)
-            vs.Mu.Unlock()
-            return fmt.Errorf("marshal reconciliation snapshot: %w", err)
-        }
+	if vs.View.Version > initialVersion {
+		latest, err := json.Marshal(vs.View)
+		if err != nil {
+			delete(vs.Subscribers, gatewayID)
+			vs.Mu.Unlock()
+			return fmt.Errorf("marshal reconciliation snapshot: %w", err)
+		}
 
-        subscriber.Updates <- latest
-    }
+		subscriber.Updates <- latest
+	}
 
-    vs.Mu.Unlock()
+	vs.Mu.Unlock()
 
-    return nil
+	return nil
 }
 
 func readMessage(conn net.Conn) ([]byte, error) {
-    var length uint32
+	var length uint32
 
-    if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-        return nil, fmt.Errorf("read message length: %w", err)
-    }
+	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+		return nil, fmt.Errorf("read message length: %w", err)
+	}
 
-    const maxMessageSize = 10 << 20 // 10 MiB
+	const maxMessageSize = 10 << 20 // 10 MiB
 
-    if length > maxMessageSize {
-        return nil, fmt.Errorf("message too large: %d bytes", length)
-    }
+	if length > maxMessageSize {
+		return nil, fmt.Errorf("message too large: %d bytes", length)
+	}
 
-    data := make([]byte, length)
+	data := make([]byte, length)
 
-    if _, err := io.ReadFull(conn, data); err != nil {
-        return nil, fmt.Errorf("read message payload: %w", err)
-    }
+	if _, err := io.ReadFull(conn, data); err != nil {
+		return nil, fmt.Errorf("read message payload: %w", err)
+	}
 
-    return data, nil
+	return data, nil
 }
 
 func writeMessage(conn net.Conn, data []byte) error {
@@ -211,7 +209,7 @@ func writeMessage(conn net.Conn, data []byte) error {
 	return nil
 }
 
-func (vs *ViewServer) update() {
+func (vs *ViewServer) updateSubscribers(data []byte) {
 }
 
 func (vs *ViewServer) gatewayHeartbeat() {
@@ -232,6 +230,7 @@ func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
 
 	if err := validateRequest(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return 
 	}
 
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -247,16 +246,21 @@ func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
 func (vs *ViewServer) applyRegistration(address string, service ServiceID) Instance {
 	id := InstanceID(uuid.New().String())
 	instance := Instance{id, address}
+
 	vs.Mu.Lock()
-	defer vs.Mu.Unlock()
 	instances := vs.View.Services[service]
+
 	if instances == nil {
 		instances = make(Instances)
 		vs.View.Services[service] = instances
 	}
 
+	vs.View.Version++
 	instances.Add(id, instance)
 	vs.LastSeen[instance.ID] = time.Now()
+	vs.Mu.Unlock()
+
+	vs.signalViewChanged()
 
 	return instance
 }
@@ -266,6 +270,7 @@ func (vs *ViewServer) PrintView() {
 	defer vs.Mu.RUnlock()
 
 	data, err := json.MarshalIndent(vs.View, "", "    ")
+
 	if err != nil {
 		fmt.Println("error: ", err)
 		return
@@ -301,6 +306,28 @@ func (vs *ViewServer) recordHeartbeat(id InstanceID) error {
 	vs.LastSeen[id] = time.Now()
 
 	return nil
+}
+
+func (vs *ViewServer) signalViewChanged() {
+	select {
+	case vs.ViewChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (vs *ViewServer) runPublisher() {
+	for range vs.ViewChanged {
+		vs.Mu.RLock()
+		data, err := json.Marshal(vs.View)
+		vs.Mu.RUnlock()
+
+		if err != nil {
+			// Log the error and handle it.
+			continue
+		}
+
+		vs.updateSubscribers(data)
+	}
 }
 
 func RunRegistrationServer(vs *ViewServer) *http.ServeMux {
