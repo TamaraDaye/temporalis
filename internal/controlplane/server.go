@@ -38,6 +38,10 @@ type Subscriber struct {
 
 }
 
+func (s *Subscriber) update() {
+}
+
+
 type RegisterRequest struct {
 	Service ServiceID `json:"service"`
 	Port    int       `json:"port"`
@@ -82,6 +86,7 @@ type ViewServer struct {
 	View        View
 	LastSeen    map[InstanceID]time.Time
 	Subscribers map[SubscriberID]*Subscriber
+	ViewChanged chan struct{}
 }
 
 func newSubscriber(id SubscriberID, conn net.Conn) Subscriber {
@@ -121,10 +126,10 @@ func (vs *ViewServer) subscribe(conn net.Conn) error {
         return fmt.Errorf("send initial view: %w", err)
     }
 
-    // Bound how long subscription establishment can take.
     if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
         return fmt.Errorf("set ACK deadline: %w", err)
     }
+
     defer conn.SetReadDeadline(time.Time{})
 
     // Read the ACK using the same length-prefixed framing.
@@ -139,6 +144,7 @@ func (vs *ViewServer) subscribe(conn net.Conn) error {
     }
 
     initialVersion := message.View.Version
+
     if ack.Version != initialVersion {
         return fmt.Errorf(
             "unexpected ACK version: got %d, expected %d",
