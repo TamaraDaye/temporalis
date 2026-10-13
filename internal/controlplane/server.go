@@ -37,6 +37,10 @@ type Subscriber struct {
 	Updates chan []byte
 }
 
+func newSubscriber(id SubscriberID, conn net.Conn) Subscriber {
+	return Subscriber{ID: id, Conn: conn, Updates: make(chan []byte, 1)}
+}
+
 func (s *Subscriber) update() {
 }
 
@@ -80,16 +84,25 @@ func (i Instances) Add(id InstanceID, instance Instance) {
 
 type ViewServer struct {
 	Application string
-	Mu          sync.RWMutex
+	mu          sync.RWMutex
 	View        View
 	LastSeen    map[InstanceID]time.Time
 	Subscribers map[SubscriberID]*Subscriber
 	ViewChanged chan struct{}
 }
-
-func newSubscriber(id SubscriberID, conn net.Conn) Subscriber {
-	return Subscriber{ID: id, Conn: conn, Updates: make(chan []byte, 1)}
+func NewViewServer(app string) *ViewServer {
+	return &ViewServer{
+		Application: app,
+		View: View{
+			Version:  0,
+			Services: make(map[ServiceID]Instances),
+		},
+		LastSeen:    make(map[InstanceID]time.Time),
+		Subscribers: make(map[SubscriberID]*Subscriber),
+		ViewChanged: make(chan struct{}, 1), // Buffered by 1 to coalesce rapid updates
+	}
 }
+
 
 func (vs *ViewServer) addSubscriber(subcriber *Subscriber) {
 	if vs.Subscribers == nil {
@@ -102,7 +115,7 @@ func (vs *ViewServer) addSubscriber(subcriber *Subscriber) {
 func (vs *ViewServer) subscribe(conn net.Conn) error {
 	gatewayID := SubscriberID(uuid.New().String())
 
-	vs.Mu.RLock()
+	vs.mu.RLock()
 
 	message := struct {
 		ID   SubscriberID `json:"id"`
@@ -114,7 +127,7 @@ func (vs *ViewServer) subscribe(conn net.Conn) error {
 
 	data, err := json.Marshal(message)
 
-	vs.Mu.RUnlock()
+	vs.mu.RUnlock()
 
 	if err != nil {
 		return fmt.Errorf("marshal initial view: %w", err)
@@ -152,7 +165,7 @@ func (vs *ViewServer) subscribe(conn net.Conn) error {
 
 	subscriber := newSubscriber(gatewayID, conn)
 
-	vs.Mu.Lock()
+	vs.mu.Lock()
 
 	vs.addSubscriber(&subscriber)
 
@@ -160,14 +173,14 @@ func (vs *ViewServer) subscribe(conn net.Conn) error {
 		latest, err := json.Marshal(vs.View)
 		if err != nil {
 			delete(vs.Subscribers, gatewayID)
-			vs.Mu.Unlock()
+			vs.mu.Unlock()
 			return fmt.Errorf("marshal reconciliation snapshot: %w", err)
 		}
 
 		subscriber.Updates <- latest
 	}
 
-	vs.Mu.Unlock()
+	vs.mu.Unlock()
 
 	return nil
 }
@@ -234,12 +247,29 @@ func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
+
 	if err != nil {
 		http.Error(w, "invalid remote address", http.StatusBadRequest)
 		return
 	}
+
 	address := net.JoinHostPort(host, strconv.Itoa(req.Port))
-	vs.applyRegistration(address, req.Service)
+	instance := vs.applyRegistration(address, req.Service)
+
+	id := struct {
+		ID InstanceID
+	} {
+		ID: instance.ID, 
+	}
+
+	response, err := json.Marshal(id)
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	}
+
+	w.Write(response)
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -247,7 +277,7 @@ func (vs *ViewServer) applyRegistration(address string, service ServiceID) Insta
 	id := InstanceID(uuid.New().String())
 	instance := Instance{id, address}
 
-	vs.Mu.Lock()
+	vs.mu.Lock()
 	instances := vs.View.Services[service]
 
 	if instances == nil {
@@ -258,7 +288,7 @@ func (vs *ViewServer) applyRegistration(address string, service ServiceID) Insta
 	vs.View.Version++
 	instances.Add(id, instance)
 	vs.LastSeen[instance.ID] = time.Now()
-	vs.Mu.Unlock()
+	vs.mu.Unlock()
 
 	vs.signalViewChanged()
 
@@ -266,8 +296,8 @@ func (vs *ViewServer) applyRegistration(address string, service ServiceID) Insta
 }
 
 func (vs *ViewServer) PrintView() {
-	vs.Mu.RLock()
-	defer vs.Mu.RUnlock()
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
 
 	data, err := json.MarshalIndent(vs.View, "", "    ")
 
@@ -296,8 +326,8 @@ func (vs *ViewServer) heartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (vs *ViewServer) recordHeartbeat(id InstanceID) error {
-	vs.Mu.Lock()
-	defer vs.Mu.Unlock()
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
 	if _, exists := vs.LastSeen[id]; !exists {
 		return ErrUnknownInstance
@@ -317,9 +347,9 @@ func (vs *ViewServer) signalViewChanged() {
 
 func (vs *ViewServer) runPublisher() {
 	for range vs.ViewChanged {
-		vs.Mu.RLock()
+		vs.mu.RLock()
 		data, err := json.Marshal(vs.View)
-		vs.Mu.RUnlock()
+		vs.mu.RUnlock()
 
 		if err != nil {
 			// Log the error and handle it.
