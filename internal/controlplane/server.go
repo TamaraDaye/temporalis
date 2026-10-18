@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"uuid"
 )
@@ -107,7 +108,7 @@ type ViewServer struct {
 	Application string
 	mu          sync.RWMutex
 	View        View
-	LastSeen    map[InstanceID]time.Time
+	LastSeen    map[InstanceID]*atomic.Int64
 	Subscribers map[SubscriberID]*Subscriber
 	ViewChanged chan struct{}
 }
@@ -119,7 +120,7 @@ func NewViewServer(app string) *ViewServer {
 			Version:  0,
 			Services: make(map[ServiceID]Instances),
 		},
-		LastSeen:    make(map[InstanceID]time.Time),
+		LastSeen:    make(map[InstanceID]*atomic.Int64),
 		Subscribers: make(map[SubscriberID]*Subscriber),
 		ViewChanged: make(chan struct{}, 1),
 	}
@@ -250,7 +251,6 @@ func readMessage(conn net.Conn) ([]byte, error) {
 
 func writeMessage(conn net.Conn, data []byte) error {
 	err := conn.SetWriteDeadline(time.Now().Add(SubscriberWriteTimeout))
-
 	if err != nil {
 		return fmt.Errorf("set write deadline : %w", err)
 	}
@@ -277,8 +277,8 @@ func (vs *ViewServer) updateSubscribers(data []byte) {
 }
 
 func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
-	defer func () { 
-		err := r.Body.Close() 
+	defer func() {
+		err := r.Body.Close()
 		if err != nil {
 			log.Printf("error on gateway end %v", err)
 		}
@@ -337,9 +337,12 @@ func (vs *ViewServer) applyRegistration(address string, service ServiceID) Insta
 		vs.View.Services[service] = instances
 	}
 
+	ts := &atomic.Int64{}
+	ts.Store(time.Now().UnixNano())
+
 	for _, existing := range instances {
 		if existing.Endpoint == address {
-			vs.LastSeen[existing.ID] = time.Now()
+			vs.LastSeen[existing.ID] = ts
 			vs.mu.Unlock()
 			return existing
 		}
@@ -350,7 +353,7 @@ func (vs *ViewServer) applyRegistration(address string, service ServiceID) Insta
 
 	vs.View.Version++
 	instances.Add(id, instance)
-	vs.LastSeen[instance.ID] = time.Now()
+	vs.LastSeen[instance.ID] = ts
 	vs.mu.Unlock()
 
 	vs.signalViewChanged()
@@ -414,8 +417,8 @@ func (vs *ViewServer) reapExpired(now time.Time, ttl time.Duration) bool {
 
 	for serviceID, instances := range vs.View.Services {
 		for instID := range instances {
-			lastSeen, exists := vs.LastSeen[instID]
-			if !exists || now.Sub(lastSeen) > ttl {
+			lastSeenPtr, exists := vs.LastSeen[instID]
+			if !exists || now.Sub(time.Unix(0, lastSeenPtr.Load())) > ttl {
 				delete(instances, instID)
 				delete(vs.LastSeen, instID)
 				changed = true
@@ -437,14 +440,16 @@ func (vs *ViewServer) reapExpired(now time.Time, ttl time.Duration) bool {
 }
 
 func (vs *ViewServer) recordHeartbeat(id InstanceID) error {
-	vs.mu.Lock()
-	defer vs.mu.Unlock()
+	vs.mu.RLock()
+	lastSeenPtr, exists := vs.LastSeen[id]
 
-	if _, exists := vs.LastSeen[id]; !exists {
+	if !exists {
 		return ErrUnknownInstance
 	}
 
-	vs.LastSeen[id] = time.Now()
+	vs.mu.RUnlock()
+
+	lastSeenPtr.Store(time.Now().UnixNano())
 
 	return nil
 }
@@ -457,24 +462,31 @@ func (vs *ViewServer) signalViewChanged() {
 }
 
 func (vs *ViewServer) runPublisher(ctx context.Context) {
-	for range vs.ViewChanged {
-		vs.mu.RLock()
-		data, err := json.Marshal(vs.View)
-		vs.mu.RUnlock()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-vs.ViewChanged:
 
-		if err != nil {
-			// Log the error and handle it.
-			continue
+			vs.mu.RLock()
+			data, err := json.Marshal(vs.View)
+			vs.mu.RUnlock()
+
+			if err != nil {
+				log.Printf("couldn't marshal current view %v", err)
+				continue
+			}
+
+			vs.updateSubscribers(data)
+
 		}
-
-		vs.updateSubscribers(data)
 	}
 }
 
 func handleSubscription(vs *ViewServer, conn net.Conn) {
-    if err := vs.subscribe(conn); err != nil {
-        log.Printf("subscription failed: %v", err)
-    }
+	if err := vs.subscribe(conn); err != nil {
+		log.Printf("subscription failed: %v", err)
+	}
 }
 
 func (vs *ViewServer) Start() {
@@ -489,15 +501,16 @@ func RunRegistrationServer(vs *ViewServer) *http.ServeMux {
 	return mux
 }
 
-func runSubscriptionServer(vs *ViewServer) error {
+func runSubscriptionServer(ctx context.Context, vs *ViewServer) error {
 	listener, err := net.Listen("tcp", ":9000")
 	if err != nil {
 		return fmt.Errorf("listen on subscripiton port: %w", err)
 	}
 
-	defer func () {
-		err := listener.Close() 
-		if err != nil { 
+	go func() {
+		<-ctx.Done()
+		err := listener.Close()
+		if err != nil {
 			log.Printf("error with tcp socket %v", err)
 		}
 	}()
@@ -509,10 +522,10 @@ func runSubscriptionServer(vs *ViewServer) error {
 				return nil
 			}
 
-			log.Printf("accept subscripiton connection : %v", err)
+			log.Printf("accept subscription connection %v", err)
+			continue
 		}
 
 		go handleSubscription(vs, conn)
-
 	}
 }
