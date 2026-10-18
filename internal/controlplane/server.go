@@ -55,18 +55,10 @@ func newSubscriber(id SubscriberID, conn net.Conn) *Subscriber {
 	return &Subscriber{ID: id, Conn: conn, Updates: make(chan []byte, 1)}
 }
 
-func (s *Subscriber) writeLoop(vs *ViewServer) {
-	defer func() {
-		err := s.Conn.Close()
-		if err != nil {
-			log.Printf("error interacting with connection %v", err)
-		}
-		vs.removeSubscriber(s.ID)
-	}()
-
+func (s *Subscriber) writeLoop() {
 	for data := range s.Updates {
 		if err := writeMessage(s.Conn, data); err != nil {
-			log.Printf("couldn't to %s write to gateway %v", s.ID, err)
+			return
 		}
 	}
 }
@@ -138,6 +130,35 @@ func (vs *ViewServer) addSubscriber(subscriber *Subscriber) {
 
 	vs.Subscribers[subscriber.ID] = subscriber
 }
+func (vs *ViewServer) snapshotInitialMessage(gatewayID SubscriberID) ([]byte, uint64, error) {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	initialVersion := vs.View.Version
+	message := struct {
+		ID   SubscriberID `json:"id"`
+		View View         `json:"view"`
+	}{
+		ID:   gatewayID,
+		View: vs.View,
+	}
+
+	data, err := json.Marshal(message)
+	return data, initialVersion, err
+}
+func (vs *ViewServer) registerSubscriber(sub *Subscriber, initialVersion uint64) {
+	vs.mu.Lock()
+	if vs.Subscribers == nil {
+		vs.Subscribers = make(map[SubscriberID]*Subscriber)
+	}
+	vs.Subscribers[sub.ID] = sub
+	missedUpdate := vs.View.Version > initialVersion
+	vs.mu.Unlock()
+
+	if missedUpdate {
+		vs.signalViewChanged()
+	}
+}
 
 func (vs *ViewServer) removeSubscriber(id SubscriberID) {
 	vs.mu.Lock()
@@ -155,82 +176,59 @@ func (s *Subscriber) pushLatest(data []byte) {
 	s.Updates <- data
 }
 
-func (vs *ViewServer) subscribe(conn net.Conn) error {
+func handleSubscription(vs *ViewServer, conn net.Conn) {
+	defer conn.Close()
+
 	gatewayID := SubscriberID(uuid.New().String())
 
-	vs.mu.RLock()
-
-	message := struct {
-		ID   SubscriberID `json:"id"`
-		View View         `json:"view"`
-	}{
-		ID:   gatewayID,
-		View: vs.View,
-	}
-
-	data, err := json.Marshal(message)
-
-	vs.mu.RUnlock()
-
+	data, initialVersion, err := vs.snapshotInitialMessage(gatewayID)
 	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("marshal initial view: %w", err)
+		log.Printf("marshal initial view for %s: %v", gatewayID, err)
+		return
 	}
 
 	if err := writeMessage(conn, data); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("send initial view: %w", err)
+		log.Printf("send initial view to %s: %v", gatewayID, err)
+		return
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("set ACK deadline: %w", err)
-	}
-
-	err = conn.SetReadDeadline(time.Time{})
-	if err != nil {
-		return fmt.Errorf("couldn't read from the subscriber maybe pipe closed %w", err)
+	if err := conn.SetReadDeadline(time.Now().Add(SubscriberHandshakeTimeout)); err != nil {
+		log.Printf("set ACK deadline for %s: %v", gatewayID, err)
+		return
 	}
 
 	ackData, err := readMessage(conn)
 	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("read gateway ACK: %w", err)
+		log.Printf("read gateway ACK from %s: %v", gatewayID, err)
+		return
+	}
+
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		log.Printf("clear ACK deadline for %s: %v", gatewayID, err)
+		return
 	}
 
 	var ack Ack
-
 	if err := json.Unmarshal(ackData, &ack); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("decode gateway ACK: %w", err)
+		log.Printf("decode gateway ACK from %s: %v", gatewayID, err)
+		return
 	}
 
-	initialVersion := message.View.Version
-
 	if ack.ID != string(gatewayID) {
-		_ = conn.Close()
-		return fmt.Errorf("unexpected ACK ID: got %s, expected %s", ack.ID, gatewayID)
+		log.Printf("unexpected ACK ID: got %s, expected %s", ack.ID, gatewayID)
+		return
 	}
 
 	if ack.Version != initialVersion {
-		_ = conn.Close()
-		return fmt.Errorf("unexpected ACK version: got %d, expected %d", ack.Version, initialVersion)
+		log.Printf("unexpected ACK version from %s: got %d, expected %d", gatewayID, ack.Version, initialVersion)
+		return
 	}
+
 	subscriber := newSubscriber(gatewayID, conn)
+	vs.registerSubscriber(subscriber, initialVersion)
+	defer vs.removeSubscriber(gatewayID)
 
-	vs.mu.Lock()
-	vs.addSubscriber(subscriber)
-
-	missedUpdate := vs.View.Version > initialVersion
-
-	vs.mu.Unlock()
-
-	if missedUpdate {
-		vs.signalViewChanged()
-	}
-
-	subscriber.writeLoop(vs)
-	return nil
+	subscriber.writeLoop()
 }
 
 func readMessage(conn net.Conn) ([]byte, error) {
@@ -523,12 +521,6 @@ func (vs *ViewServer) runPublisher(ctx context.Context) {
 			vs.updateSubscribers(data)
 
 		}
-	}
-}
-
-func handleSubscription(vs *ViewServer, conn net.Conn) {
-	if err := vs.subscribe(conn); err != nil {
-		log.Printf("subscription failed: %v", err)
 	}
 }
 
