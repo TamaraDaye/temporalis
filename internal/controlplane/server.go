@@ -46,6 +46,11 @@ type Subscriber struct {
 	Updates chan []byte
 }
 
+type trackedInstance struct {
+	service ServiceID 
+	lastSeen atomic.Int64
+}
+
 func newSubscriber(id SubscriberID, conn net.Conn) *Subscriber {
 	return &Subscriber{ID: id, Conn: conn, Updates: make(chan []byte, 1)}
 }
@@ -108,7 +113,7 @@ type ViewServer struct {
 	Application string
 	mu          sync.RWMutex
 	View        View
-	LastSeen    map[InstanceID]*atomic.Int64
+	LastSeen    map[InstanceID]*trackedInstance
 	Subscribers map[SubscriberID]*Subscriber
 	ViewChanged chan struct{}
 }
@@ -120,7 +125,7 @@ func NewViewServer(app string) *ViewServer {
 			Version:  0,
 			Services: make(map[ServiceID]Instances),
 		},
-		LastSeen:    make(map[InstanceID]*atomic.Int64),
+		LastSeen:    make(map[InstanceID]*trackedInstance),
 		Subscribers: make(map[SubscriberID]*Subscriber),
 		ViewChanged: make(chan struct{}, 1),
 	}
@@ -276,6 +281,74 @@ func (vs *ViewServer) updateSubscribers(data []byte) {
 	}
 }
 
+func (vs *ViewServer) deregisterInstance(id InstanceID) error {
+	vs.mu.Lock()
+
+	tracked, exists := vs.LastSeen[id]
+	if !exists {
+		vs.mu.Unlock()
+		return ErrUnknownInstance
+	}
+
+	delete(vs.LastSeen, id)
+
+	if instances, ok := vs.View.Services[tracked.service]; ok {
+		delete(instances, id)
+		if len(instances) == 0 {
+			delete(vs.View.Services, tracked.service)
+		}
+	}
+
+	vs.View.Version++
+	vs.mu.Unlock()
+
+	vs.signalViewChanged()
+	return nil
+}
+
+
+func (vs *ViewServer) deregister(w http.ResponseWriter, r *http.Request) {
+	rawID := r.Header.Get("X-Instance-ID")
+
+	if strings.TrimSpace(string(rawID)) == "" {
+		http.Error(w, "instance ID not provided", http.StatusBadRequest)
+		return
+	}
+	id := InstanceID(rawID)
+
+	vs.deregisterInstance(id)
+}
+
+func (vs *ViewServer) applyRegistration(address string, service ServiceID) Instance {
+	vs.mu.Lock()
+	instances := vs.View.Services[service]
+	for _, existing := range instances {
+		if existing.Endpoint == address {
+			if tracked, ok := vs.LastSeen[existing.ID]; ok {
+				tracked.lastSeen.Store(time.Now().UnixNano())
+			}
+			vs.mu.Unlock()
+			return existing
+		}
+	}
+
+	id := InstanceID(fmt.Sprintf("%s-%s", service, uuid.New().String()))
+	instance := Instance{ID: id, Endpoint: address}
+
+	tracked := &trackedInstance{service: service}
+	tracked.lastSeen.Store(time.Now().UnixNano())
+
+	vs.View.Version++
+	instances.Add(id, instance)
+	vs.LastSeen[instance.ID] = tracked
+	vs.mu.Unlock()
+
+	vs.signalViewChanged()
+
+	return instance
+}
+
+
 func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		err := r.Body.Close()
@@ -329,37 +402,6 @@ func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (vs *ViewServer) applyRegistration(address string, service ServiceID) Instance {
-	vs.mu.Lock()
-	instances := vs.View.Services[service]
-	if instances == nil {
-		instances = make(Instances)
-		vs.View.Services[service] = instances
-	}
-
-	ts := &atomic.Int64{}
-	ts.Store(time.Now().UnixNano())
-
-	for _, existing := range instances {
-		if existing.Endpoint == address {
-			vs.LastSeen[existing.ID] = ts
-			vs.mu.Unlock()
-			return existing
-		}
-	}
-
-	id := InstanceID(uuid.New().String())
-	instance := Instance{ID: id, Endpoint: address}
-
-	vs.View.Version++
-	instances.Add(id, instance)
-	vs.LastSeen[instance.ID] = ts
-	vs.mu.Unlock()
-
-	vs.signalViewChanged()
-
-	return instance
-}
 
 func (vs *ViewServer) PrintView() {
 	vs.mu.RLock()
@@ -417,8 +459,8 @@ func (vs *ViewServer) reapExpired(now time.Time, ttl time.Duration) bool {
 
 	for serviceID, instances := range vs.View.Services {
 		for instID := range instances {
-			lastSeenPtr, exists := vs.LastSeen[instID]
-			if !exists || now.Sub(time.Unix(0, lastSeenPtr.Load())) > ttl {
+			tracked, exists := vs.LastSeen[instID]
+			if !exists || now.Sub(time.Unix(0, tracked.lastSeen.Load())) > ttl {
 				delete(instances, instID)
 				delete(vs.LastSeen, instID)
 				changed = true
@@ -429,10 +471,13 @@ func (vs *ViewServer) reapExpired(now time.Time, ttl time.Duration) bool {
 			delete(vs.View.Services, serviceID)
 		}
 	}
-	vs.mu.Unlock()
 
 	if changed {
 		vs.View.Version++
+	}
+	vs.mu.Unlock()
+
+	if changed {
 		vs.signalViewChanged()
 	}
 
@@ -441,16 +486,14 @@ func (vs *ViewServer) reapExpired(now time.Time, ttl time.Duration) bool {
 
 func (vs *ViewServer) recordHeartbeat(id InstanceID) error {
 	vs.mu.RLock()
-	lastSeenPtr, exists := vs.LastSeen[id]
+	tracked, exists := vs.LastSeen[id]
+	vs.mu.RUnlock()
 
 	if !exists {
 		return ErrUnknownInstance
 	}
 
-	vs.mu.RUnlock()
-
-	lastSeenPtr.Store(time.Now().UnixNano())
-
+	tracked.lastSeen.Store(time.Now().UnixNano())
 	return nil
 }
 
@@ -496,6 +539,7 @@ func RunRegistrationServer(vs *ViewServer) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /register", vs.register)
+	mux.HandleFunc("DELETE /deregister", vs.deregister)
 	mux.HandleFunc("POST /heartbeat", vs.heartbeat)
 
 	return mux
