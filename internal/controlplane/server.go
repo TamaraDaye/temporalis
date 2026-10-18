@@ -51,16 +51,16 @@ func newSubscriber(id SubscriberID, conn net.Conn) *Subscriber {
 
 func (s *Subscriber) writeLoop(vs *ViewServer) {
 	defer func() {
-		s.Conn.Close()
+		err := s.Conn.Close()
+		if err != nil {
+			log.Printf("error interacting with connection %v", err)
+		}
 		vs.removeSubscriber(s.ID)
 	}()
 
 	for data := range s.Updates {
-		if err := s.Conn.SetWriteDeadline(time.Now().Add(SubscriberWriteTimeout)); err != nil {
-			return
-		}
 		if err := writeMessage(s.Conn, data); err != nil {
-			return
+			log.Printf("couldn't to %s write to gateway %v", s.ID, err)
 		}
 	}
 }
@@ -125,12 +125,12 @@ func NewViewServer(app string) *ViewServer {
 	}
 }
 
-func (vs *ViewServer) addSubscriber(subcriber *Subscriber) {
+func (vs *ViewServer) addSubscriber(subscriber *Subscriber) {
 	if vs.Subscribers == nil {
 		vs.Subscribers = make(map[SubscriberID]*Subscriber)
 	}
 
-	vs.Subscribers[subcriber.ID] = subcriber
+	vs.Subscribers[subscriber.ID] = subscriber
 }
 
 func (vs *ViewServer) removeSubscriber(id SubscriberID) {
@@ -167,44 +167,47 @@ func (vs *ViewServer) subscribe(conn net.Conn) error {
 	vs.mu.RUnlock()
 
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("marshal initial view: %w", err)
 	}
 
 	if err := writeMessage(conn, data); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("send initial view: %w", err)
 	}
 
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("set ACK deadline: %w", err)
 	}
 
-	defer conn.SetReadDeadline(time.Time{})
+	err = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return fmt.Errorf("couldn't read from the subscriber maybe pipe closed %w", err)
+	}
 
 	ackData, err := readMessage(conn)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("read gateway ACK: %w", err)
 	}
 
 	var ack Ack
 
 	if err := json.Unmarshal(ackData, &ack); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("decode gateway ACK: %w", err)
 	}
 
 	initialVersion := message.View.Version
 
 	if ack.ID != string(gatewayID) {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("unexpected ACK ID: got %s, expected %s", ack.ID, gatewayID)
 	}
 
 	if ack.Version != initialVersion {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("unexpected ACK version: got %d, expected %d", ack.Version, initialVersion)
 	}
 	subscriber := newSubscriber(gatewayID, conn)
@@ -246,6 +249,11 @@ func readMessage(conn net.Conn) ([]byte, error) {
 }
 
 func writeMessage(conn net.Conn, data []byte) error {
+	err := conn.SetWriteDeadline(time.Now().Add(SubscriberWriteTimeout))
+
+	if err != nil {
+		return fmt.Errorf("set write deadline : %w", err)
+	}
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(data)))
 
@@ -255,6 +263,7 @@ func writeMessage(conn net.Conn, data []byte) error {
 	if _, err := conn.Write(data); err != nil {
 		return fmt.Errorf("write message payload: %w", err)
 	}
+
 	return nil
 }
 
@@ -268,7 +277,12 @@ func (vs *ViewServer) updateSubscribers(data []byte) {
 }
 
 func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+	defer func () { 
+		err := r.Body.Close() 
+		if err != nil {
+			log.Printf("error on gateway end %v", err)
+		}
+	}()
 
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req RegisterRequest
@@ -303,12 +317,16 @@ func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
 	response, err := json.Marshal(id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 
-	w.Write(response)
-
 	w.WriteHeader(http.StatusOK)
+
+	if _, err = w.Write(response); err != nil {
+		log.Printf("encoutered err %v", err)
+	}
 }
 
 func (vs *ViewServer) applyRegistration(address string, service ServiceID) Instance {
@@ -354,7 +372,13 @@ func (vs *ViewServer) PrintView() {
 }
 
 func (vs *ViewServer) heartbeat(w http.ResponseWriter, r *http.Request) {
-	id := InstanceID(r.Header.Get("X-Instance-ID"))
+	rawID := r.Header.Get("X-Instance-ID")
+
+	if strings.TrimSpace(string(rawID)) == "" {
+		http.Error(w, "instance ID not provided", http.StatusBadRequest)
+		return
+	}
+	id := InstanceID(rawID)
 
 	if err := vs.recordHeartbeat(id); err != nil {
 		if errors.Is(err, ErrUnknownInstance) {
@@ -402,12 +426,12 @@ func (vs *ViewServer) reapExpired(now time.Time, ttl time.Duration) bool {
 			delete(vs.View.Services, serviceID)
 		}
 	}
+	vs.mu.Unlock()
 
 	if changed {
 		vs.View.Version++
 		vs.signalViewChanged()
 	}
-	vs.mu.Unlock()
 
 	return changed
 }
@@ -432,7 +456,7 @@ func (vs *ViewServer) signalViewChanged() {
 	}
 }
 
-func (vs *ViewServer) runPublisher() {
+func (vs *ViewServer) runPublisher(ctx context.Context) {
 	for range vs.ViewChanged {
 		vs.mu.RLock()
 		data, err := json.Marshal(vs.View)
@@ -447,29 +471,48 @@ func (vs *ViewServer) runPublisher() {
 	}
 }
 
+func handleSubscription(vs *ViewServer, conn net.Conn) {
+    if err := vs.subscribe(conn); err != nil {
+        log.Printf("subscription failed: %v", err)
+    }
+}
+
+func (vs *ViewServer) Start() {
+}
+
 func RunRegistrationServer(vs *ViewServer) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/register", vs.register)
-	mux.HandleFunc("/heartbeat", vs.heartbeat)
+	mux.HandleFunc("POST /register", vs.register)
+	mux.HandleFunc("POST /heartbeat", vs.heartbeat)
 
 	return mux
 }
 
-func runSubscriptionServer(vs *ViewServer) {
+func runSubscriptionServer(vs *ViewServer) error {
 	listener, err := net.Listen("tcp", ":9000")
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("listen on subscripiton port: %w", err)
 	}
 
-	defer listener.Close()
+	defer func () {
+		err := listener.Close() 
+		if err != nil { 
+			log.Printf("error with tcp socket %v", err)
+		}
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			continue
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+
+			log.Printf("accept subscripiton connection : %v", err)
 		}
 
-		go vs.subscribe(conn)
+		go handleSubscription(vs, conn)
+
 	}
 }
