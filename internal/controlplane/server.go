@@ -41,23 +41,30 @@ type (
 )
 
 type Subscriber struct {
-	ID      SubscriberID
-	Conn    net.Conn
-	Updates chan []byte
+	ID          SubscriberID
+	Conn        net.Conn
+	Updates     chan []byte
+	lastVersion uint64
+}
+
+type viewSnapshot struct {
+	version uint64
+	data    []byte
 }
 
 type trackedInstance struct {
-	service ServiceID 
+	service  ServiceID
 	lastSeen atomic.Int64
 }
 
-func newSubscriber(id SubscriberID, conn net.Conn) *Subscriber {
-	return &Subscriber{ID: id, Conn: conn, Updates: make(chan []byte, 1)}
+func newSubscriber(id SubscriberID, conn net.Conn, viewVersion uint64) *Subscriber {
+	return &Subscriber{ID: id, Conn: conn, Updates: make(chan []byte, 1), lastVersion: viewVersion}
 }
 
 func (s *Subscriber) writeLoop() {
 	for data := range s.Updates {
 		if err := writeMessage(s.Conn, data); err != nil {
+			log.Printf("could not connect to subscriber %v", err)
 			return
 		}
 	}
@@ -108,6 +115,7 @@ type ViewServer struct {
 	LastSeen    map[InstanceID]*trackedInstance
 	Subscribers map[SubscriberID]*Subscriber
 	ViewChanged chan struct{}
+	start       time.Time
 }
 
 func NewViewServer(app string) *ViewServer {
@@ -120,6 +128,7 @@ func NewViewServer(app string) *ViewServer {
 		LastSeen:    make(map[InstanceID]*trackedInstance),
 		Subscribers: make(map[SubscriberID]*Subscriber),
 		ViewChanged: make(chan struct{}, 1),
+		start: time.Now(),
 	}
 }
 
@@ -130,6 +139,7 @@ func (vs *ViewServer) addSubscriber(subscriber *Subscriber) {
 
 	vs.Subscribers[subscriber.ID] = subscriber
 }
+
 func (vs *ViewServer) snapshotInitialMessage(gatewayID SubscriberID) ([]byte, uint64, error) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
@@ -146,12 +156,10 @@ func (vs *ViewServer) snapshotInitialMessage(gatewayID SubscriberID) ([]byte, ui
 	data, err := json.Marshal(message)
 	return data, initialVersion, err
 }
+
 func (vs *ViewServer) registerSubscriber(sub *Subscriber, initialVersion uint64) {
 	vs.mu.Lock()
-	if vs.Subscribers == nil {
-		vs.Subscribers = make(map[SubscriberID]*Subscriber)
-	}
-	vs.Subscribers[sub.ID] = sub
+	vs.addSubscriber(sub)
 	missedUpdate := vs.View.Version > initialVersion
 	vs.mu.Unlock()
 
@@ -224,7 +232,7 @@ func handleSubscription(vs *ViewServer, conn net.Conn) {
 		return
 	}
 
-	subscriber := newSubscriber(gatewayID, conn)
+	subscriber := newSubscriber(gatewayID, conn, initialVersion)
 	vs.registerSubscriber(subscriber, initialVersion)
 	defer vs.removeSubscriber(gatewayID)
 
@@ -260,22 +268,25 @@ func writeMessage(conn net.Conn, data []byte) error {
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(data)))
 
-	if _, err := conn.Write(header[:]); err != nil {
-		return fmt.Errorf("write message length: %w", err)
-	}
-	if _, err := conn.Write(data); err != nil {
-		return fmt.Errorf("write message payload: %w", err)
+	bufs := net.Buffers{header[:], data}
+
+	if _, err := bufs.WriteTo(conn); err != nil {
+		return fmt.Errorf("write message :%w", err)
 	}
 
 	return nil
 }
 
-func (vs *ViewServer) updateSubscribers(data []byte) {
+func (vs *ViewServer) updateSubscribers(snapshot viewSnapshot) {
 	vs.mu.RLock()
 	defer vs.mu.RUnlock()
 
 	for _, sub := range vs.Subscribers {
-		sub.pushLatest(data)
+		if sub.lastVersion >= snapshot.version {
+			continue
+		}
+		sub.lastVersion = snapshot.version
+		sub.pushLatest(snapshot.data)
 	}
 }
 
@@ -304,22 +315,28 @@ func (vs *ViewServer) deregisterInstance(id InstanceID) error {
 	return nil
 }
 
+func handleDeregistration(vs *ViewServer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rawID := r.Header.Get("X-Instance-ID")
 
-func (vs *ViewServer) deregister(w http.ResponseWriter, r *http.Request) {
-	rawID := r.Header.Get("X-Instance-ID")
+		if strings.TrimSpace(string(rawID)) == "" {
+			http.Error(w, "instance ID not provided", http.StatusBadRequest)
+			return
+		}
+		id := InstanceID(rawID)
 
-	if strings.TrimSpace(string(rawID)) == "" {
-		http.Error(w, "instance ID not provided", http.StatusBadRequest)
-		return
+		vs.deregisterInstance(id)
 	}
-	id := InstanceID(rawID)
-
-	vs.deregisterInstance(id)
 }
 
 func (vs *ViewServer) applyRegistration(address string, service ServiceID) Instance {
 	vs.mu.Lock()
 	instances := vs.View.Services[service]
+
+	if instances == nil {
+		instances = make(Instances)
+		vs.View.Services[service] = instances
+	}
 	for _, existing := range instances {
 		if existing.Endpoint == address {
 			if tracked, ok := vs.LastSeen[existing.ID]; ok {
@@ -334,7 +351,7 @@ func (vs *ViewServer) applyRegistration(address string, service ServiceID) Insta
 	instance := Instance{ID: id, Endpoint: address}
 
 	tracked := &trackedInstance{service: service}
-	tracked.lastSeen.Store(time.Now().UnixNano())
+	tracked.lastSeen.Store(int64(time.Since(vs.start)))
 
 	vs.View.Version++
 	instances.Add(id, instance)
@@ -346,60 +363,60 @@ func (vs *ViewServer) applyRegistration(address string, service ServiceID) Insta
 	return instance
 }
 
+func handleRegistration(vs *ViewServer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			err := r.Body.Close()
+			if err != nil {
+				log.Printf("error on gateway end %v", err)
+			}
+		}()
 
-func (vs *ViewServer) register(w http.ResponseWriter, r *http.Request) {
-	defer func() {
-		err := r.Body.Close()
-		if err != nil {
-			log.Printf("error on gateway end %v", err)
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var req RegisterRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+
+		if err := decoder.Decode(&req); err != nil {
+			http.Error(w, "Invalid Json: "+err.Error(), http.StatusBadRequest)
+			return
 		}
-	}()
 
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	var req RegisterRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
+		if err := validateRequest(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-	if err := decoder.Decode(&req); err != nil {
-		http.Error(w, "Invalid Json: "+err.Error(), http.StatusBadRequest)
-		return
-	}
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "invalid remote address", http.StatusBadRequest)
+			return
+		}
 
-	if err := validateRequest(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+		address := net.JoinHostPort(host, strconv.Itoa(req.Port))
+		instance := vs.applyRegistration(address, req.Service)
 
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		http.Error(w, "invalid remote address", http.StatusBadRequest)
-		return
-	}
+		id := struct {
+			ID InstanceID `json:"id"`
+		}{
+			ID: instance.ID,
+		}
 
-	address := net.JoinHostPort(host, strconv.Itoa(req.Port))
-	instance := vs.applyRegistration(address, req.Service)
+		response, err := json.Marshal(id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-	id := struct {
-		ID InstanceID `json:"id"`
-	}{
-		ID: instance.ID,
-	}
+		w.Header().Set("Content-Type", "application/json")
 
-	response, err := json.Marshal(id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+		w.WriteHeader(http.StatusOK)
 
-	w.Header().Set("Content-Type", "application/json")
-
-	w.WriteHeader(http.StatusOK)
-
-	if _, err = w.Write(response); err != nil {
-		log.Printf("encoutered err %v", err)
+		if _, err = w.Write(response); err != nil {
+			log.Printf("encoutered err %v", err)
+		}
 	}
 }
-
 
 func (vs *ViewServer) PrintView() {
 	vs.mu.RLock()
@@ -414,26 +431,28 @@ func (vs *ViewServer) PrintView() {
 	fmt.Println(string(data))
 }
 
-func (vs *ViewServer) heartbeat(w http.ResponseWriter, r *http.Request) {
-	rawID := r.Header.Get("X-Instance-ID")
+func handleHeartBeats(vs *ViewServer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rawID := r.Header.Get("X-Instance-ID")
 
-	if strings.TrimSpace(string(rawID)) == "" {
-		http.Error(w, "instance ID not provided", http.StatusBadRequest)
-		return
-	}
-	id := InstanceID(rawID)
+		if strings.TrimSpace(string(rawID)) == "" {
+			http.Error(w, "instance ID not provided", http.StatusBadRequest)
+			return
+		}
+		id := InstanceID(rawID)
 
-	if err := vs.recordHeartbeat(id); err != nil {
-		if errors.Is(err, ErrUnknownInstance) {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		if err := vs.recordHeartbeat(id); err != nil {
+			if errors.Is(err, ErrUnknownInstance) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 
-		http.Error(w, "internal server error", http.StatusInternalServerError)
-		return
+		w.WriteHeader(http.StatusNoContent)
 	}
-
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func (vs *ViewServer) runReaper(ctx context.Context, ttl, interval time.Duration) {
@@ -510,6 +529,7 @@ func (vs *ViewServer) runPublisher(ctx context.Context) {
 		case <-vs.ViewChanged:
 
 			vs.mu.RLock()
+			version := vs.View.Version
 			data, err := json.Marshal(vs.View)
 			vs.mu.RUnlock()
 
@@ -518,7 +538,7 @@ func (vs *ViewServer) runPublisher(ctx context.Context) {
 				continue
 			}
 
-			vs.updateSubscribers(data)
+			vs.updateSubscribers(viewSnapshot{version, data})
 
 		}
 	}
@@ -527,12 +547,12 @@ func (vs *ViewServer) runPublisher(ctx context.Context) {
 func (vs *ViewServer) Start() {
 }
 
-func RunRegistrationServer(vs *ViewServer) *http.ServeMux {
+func NewRegistrationHandler(vs *ViewServer) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /register", vs.register)
-	mux.HandleFunc("DELETE /deregister", vs.deregister)
-	mux.HandleFunc("POST /heartbeat", vs.heartbeat)
+	mux.HandleFunc("POST /register", handleRegistration(vs))
+	mux.HandleFunc("DELETE /deregister", handleDeregistration(vs))
+	mux.HandleFunc("POST /heartbeat", handleHeartBeats(vs))
 
 	return mux
 }
