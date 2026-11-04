@@ -21,8 +21,8 @@ func main() {
 	flag.DurationVar(&cfg.ReapInterval, "reap-interval", cfg.ReapInterval, "how often to scan for expired instances")
 	flag.Parse()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	log.Printf("starting control plane %q: http=%s subscription=%s", cfg.Application, cfg.HTTPAddr, cfg.SubscriptionAddr)
 	if err := controlplane.NewServer(cfg).Run(ctx); err != nil {
