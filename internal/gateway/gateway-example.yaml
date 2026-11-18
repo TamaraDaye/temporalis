@@ -1,0 +1,67 @@
+gateway:
+  listen_addr: "0.0.0.0:8080"
+  shutdown_timeout: 10s
+
+  server:
+    read_header_timeout: 5s
+    idle_timeout: 60s
+    max_header_bytes: 1048576
+
+  transport:
+    dial_timeout: 500ms
+    response_header_timeout: 3s
+    idle_conn_timeout: 90s
+    max_idle_conns: 100
+    max_idle_conns_per_host: 10
+
+routes:
+  - name: users-api
+    match:
+      host: "api.example.com"
+      path_prefix: "/users"
+    service: users
+    strip_prefix: false
+
+  - name: orders-api
+    match:
+      host: "api.example.com"
+      path_prefix: "/orders"
+    service: orders
+    strip_prefix: false
+
+services:
+  users:
+    load_balancing:
+      strategy: adaptive
+      fallback: round_robin
+
+    health_check:
+      enabled: true
+      path: "/health"
+      interval: 5s
+      timeout: 1s
+      unhealthy_threshold: 3
+      healthy_threshold: 2
+
+    instances:
+      - id: users-1
+        url: "http://127.0.0.1:8001"
+      - id: users-2
+        url: "http://127.0.0.1:8002"
+
+  orders:
+    load_balancing:
+      strategy: round_robin
+      fallback: round_robin
+
+    health_check:
+      enabled: true
+      path: "/health"
+      interval: 5s
+      timeout: 1s
+      unhealthy_threshold: 3
+      healthy_threshold: 2
+
+    instances:
+      - id: orders-1
+        url: "http://127.0.0.1:9001"
